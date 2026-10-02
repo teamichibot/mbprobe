@@ -1,0 +1,46 @@
+name: test-and-build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - name: Unit + read-only + acceptance test (bus RS485 virtual via pty)
+        run: python -m pytest -v
+
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - name: Unit + read-only test (acceptance otomatis di-skip di Windows)
+        run: python -m pytest -v
+      - name: Build mbprobe.exe
+        run: pyinstaller --noconfirm --onefile --console --name mbprobe --collect-submodules serial.tools mbprobe/__main__.py
+      - name: Smoke test exe (tanpa Python) vs simulator TCP
+        shell: pwsh
+        run: |
+          .\dist\mbprobe.exe version
+          .\dist\mbprobe.exe ports
+          $sim = Start-Process python -ArgumentList "sim/sim_server.py","tcp","--port","5020" -PassThru
+          Start-Sleep -Seconds 3
+          .\dist\mbprobe.exe read --tcp 127.0.0.1 --tcp-port 5020 --unit 1 --addr 300 --count 4 --label ci
+          .\dist\mbprobe.exe find-value --tcp 127.0.0.1 --tcp-port 5020 --unit 1 --value 82826 --from 280 --to 320 --label ci
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Stop-Process -Id $sim.Id
+          Get-ChildItem -Recurse sessions | Select-Object FullName
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mbprobe-windows
+          path: dist/mbprobe.exe

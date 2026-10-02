@@ -1,0 +1,14 @@
+# Config untuk simulator (sim/sim_server.py). Port diisi lewat --port saat poll.
+name: SIM GA
+connection:
+  type: rtu
+  port: /dev/null
+  baud: 19200
+  parity: E
+  slave_id: 7
+registers:
+  - {name: outlet_pressure, fc: 3, addr: 120, type: int16, scale: 0.01, unit: bar}
+  - {name: running_hours, fc: 3, addr: 300, type: uint32, word_order: CDAB, unit: h}
+  - {name: load_hours, fc: 3, addr: 302, type: uint32, word_order: CDAB, unit: h}
+  - {name: element_temp, fc: 3, addr: 310, type: float32, word_order: ABCD, unit: C}
+  - {name: input_reg_0, fc: 4, addr: 0}

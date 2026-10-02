@@ -1,0 +1,26 @@
+# Contoh config unit. Alamat di bawah HANYA contoh — isi dengan hasil find-value/dump.
+name: GA 110 VSD
+connection:
+  type: rtu            # atau tcp
+  port: COM5           # Linux: /dev/ttyUSB0
+  baud: 9600
+  parity: N
+  stopbits: 1
+  slave_id: 1
+  timeout: 1.0
+  # untuk tcp:
+  # host: 192.168.1.50
+  # tcp_port: 502
+registers:
+  - name: outlet_pressure
+    fc: 3
+    addr: 120
+    type: int16
+    scale: 0.01
+    unit: bar
+  - name: running_hours
+    fc: 3
+    addr: 300
+    type: uint32
+    word_order: CDAB
+    unit: h

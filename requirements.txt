@@ -1,0 +1,6 @@
+pymodbus>=3.6,<4
+pyserial>=3.5
+typer>=0.27
+rich>=13
+PyYAML>=6
+prompt_toolkit>=3.0.52

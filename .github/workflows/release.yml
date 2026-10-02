@@ -1,0 +1,64 @@
+name: release
+
+# Buat rilis: git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: mbprobe-windows-x64.exe
+            built: dist/mbprobe.exe
+          - os: ubuntu-22.04
+            asset: mbprobe-linux-x64
+            built: dist/mbprobe
+          - os: macos-latest
+            asset: mbprobe-macos-arm64
+            built: dist/mbprobe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt pyinstaller pytest
+      - name: Unit + read-only test
+        run: python -m pytest tests/test_protocol.py tests/test_decode.py tests/test_readonly.py -q
+      - name: Build
+        run: pyinstaller --noconfirm --onefile --console --name mbprobe --collect-submodules serial.tools mbprobe/__main__.py
+      - name: Smoke test
+        run: ${{ matrix.built }} version
+      - name: Rename
+        shell: bash
+        run: mkdir out && cp "${{ matrix.built }}" "out/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ls -la assets
+          gh release create "$tag" assets/* --title "mbprobe $tag" --generate-notes \
+            || gh release upload "$tag" assets/* --clobber
