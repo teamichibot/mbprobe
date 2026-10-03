@@ -94,7 +94,10 @@ def build_tcp_request(tid: int, unit: int, fc: int, addr: int, count: int) -> by
 
 @dataclass
 class Result:
-    """Hasil satu request. status: ok | exception | timeout | crc_error | invalid | port_error"""
+    """Hasil satu request.
+
+    status: ok | exception | nonstandard | late | timeout | crc_error | invalid | port_error
+    """
 
     status: str
     fc: int
@@ -111,8 +114,13 @@ class Result:
 
     @property
     def responded(self) -> bool:
-        """Device hidup & bicara Modbus (ok atau exception valid)."""
+        """Jawaban Modbus valid untuk request INI (ok atau exception)."""
         return self.status in ("ok", "exception")
+
+    @property
+    def alive(self) -> bool:
+        """Ada device di ID ini: jawaban valid, frame non-standar, atau jawaban telat (CRC valid)."""
+        return self.status in ("ok", "exception", "nonstandard", "late")
 
     def describe(self) -> str:
         if self.status == "ok":

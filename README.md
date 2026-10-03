@@ -149,6 +149,9 @@ misalnya untuk script.
 | `CRC_ERROR` / "byte diterima tapi CRC tidak valid" | Ada device, tapi baud/parity salah. Bisa juga noise: cek GND, shield, terminasi 120 Ω |
 | Sniff: "ada lalu lintas non-Modbus" di semua kombinasi | Protokol proprietary (bukan Modbus RTU), atau format 7-bit/2 stop bit (coba `--stopbits 2`) |
 | `EXCEPTION 02` | Device **hidup**, alamat saja yang tidak valid. Lanjut `dump` |
+| `NONSTANDARD` (mis. frame `01 09 02`) | Device **hidup**, tapi menolak alamat/FC itu dengan frame non-baku (umum di sensor murah). Lanjut `dump --fc 3` dan `dump --fc 4` untuk mencari alamat yang valid |
+| "balasan datang setelah timeout" / `LATE` | Device hidup tapi **lambat**. Naikkan `--timeout` (mis. 2–3 s). Contoh: sensor SHT20/MD02 butuh ±600 ms, dan ±1,1 s kalau request beruntun |
+| "Tidak ada SATU byte pun … di semua kombinasi" | Hampir pasti fisik: A/B, daya, terminal longgar, atau port dipegang program lain (Node-RED dll.). Kalau wiring yakin benar: `--timeout 2`, `--addr 1` |
 | `EXCEPTION 01` | FC tidak didukung. Coba FC03 ↔ FC04 |
 | TCP: port 502 tertutup | Modbus TCP belum aktif di controller. Cek menu/web server controller |
 | "Adaptor memantulkan byte (echo)" | Normal untuk beberapa adaptor. Sudah otomatis diabaikan |
@@ -179,14 +182,15 @@ bisa dipakai ulang untuk gateway ThingsBoard/MQTT di fase berikutnya.
 ```
 mbprobe ports
 mbprobe sniff      --port COM5 [--baud 9600 --parity N | --auto [--dwell 5]] [--duration 60] [--gap-ms N] [-q]
-mbprobe scan-rtu   --port COM5 [--bauds 9600,19200,38400] [--parity N,E] [--ids 1-32] [--timeout 0.3] [--delay 0.1] [--stop-on-first]
+mbprobe scan-rtu   --port COM5 [--bauds 9600,19200,38400] [--parity N,E] [--ids 1-32] [--timeout 1.0] [--addr 0] [--delay 0.1] [--stop-on-first]
 mbprobe scan-tcp   (--subnet 192.168.1.0/24 | --host IP) [--ports 502,80,443] [--unit-ids 0,1,255] [--modbus-port 502]
 mbprobe read       (--rtu COM5 --baud --parity --id | --tcp IP [--tcp-port 502] --unit) --fc 3 --addr 0 --count 10
 mbprobe dump       (--rtu … | --tcp …) --fc 3 --from 0 --to 2000 [--block 50] [--delay 0.1]
 mbprobe find-value (--rtu … | --tcp …) --value 82826 [--value 3.7 …] [--tolerance 0] --from 0 --to 2000
 mbprobe poll       --config unit.yaml [--interval 5] [--duration 3600] [--port COM6]
 ```
-Opsi bersama: `--label`, `--out`, `--timeout`, `--stopbits`. `--id` dan `--unit` adalah alias.
+Opsi bersama: `--label`, `--out`, `--timeout` (default RTU 2 s untuk read/dump/find/poll, 1 s per percobaan
+untuk scan), `--stopbits`. `--id` dan `--unit` adalah alias.
 `mbprobe <command> --help` untuk detail.
 
 ## Testing
@@ -244,6 +248,13 @@ baud/parity yang sebenarnya dilakukan di acceptance test Linux/macOS dan di uji 
 
 ### Uji hardware (wajib sebelum genba)
 
+**Hasil 2026-10-03**: adaptor CH340 (1A86:7523) + sensor suhu/kelembapan RS485 SHT20/MD02 di macOS:
+`scan` menemukan ID 1 @ 9600 N (respon non-standar), `dump --fc 4` memetakan alamat 0–2 valid,
+`poll -c examples/sensor_sht20.yaml` membaca 32,7 °C / 58,5 %RH tanpa error. Temuan dari uji ini:
+device lambat (±0,6–1,1 s) dan frame error non-standar — keduanya sekarang ditangani dan ada test-nya.
+Sisa: uji di laptop Windows.
+
+
 Dengan adaptor USB-RS485 nyata ke device Modbus di kantor (power meter / PLC / VFD):
 1. `ports` → adaptor terdeteksi
 2. `sniff --auto` dengan device diam → "bus sepi"
@@ -263,6 +274,9 @@ Dengan adaptor USB-RS485 nyata ke device Modbus di kantor (power meter / PLC / V
 - `sniff` memakai jeda antar byte + struktur frame + CRC. Latency adaptor USB (FTDI ±16 ms) bisa
   menggabungkan beberapa frame dalam satu chunk. Itu ditangani oleh parser, tapi frame FC selain 01–04
   hanya dikenali kalau ada jeda di antaranya.
+- Jangan jalankan mbprobe bersamaan dengan program lain yang memakai port yang sama (Node-RED, Modbus Poll).
+  Di macOS, `/dev/cu.*` akan ditolak ("Resource busy", mbprobe menyebut nama prosesnya), tapi `/dev/tty.*`
+  bisa terbuka bersamaan dan balasan device jadi rebutan.
 - Protokol proprietary Atlas Copco / CAN **tidak** didekode. `sniff` hanya melaporkan bahwa ada
   lalu lintas non-Modbus dan menyimpan hex mentah di `summary.json` / `log.txt`.
 - Di luar scope: GUI, fungsi tulis/kontrol, integrasi dashboard.

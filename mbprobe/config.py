@@ -24,7 +24,7 @@ class Connection:
     slave_id: int = 1
     host: str = ""
     tcp_port: int = 502
-    timeout: float = 1.0
+    timeout: float = 2.0
 
 
 @dataclass
@@ -73,7 +73,7 @@ def load_config(path: str | Path) -> UnitConfig:
         slave_id=int(c.get("slave_id", c.get("unit_id", 1))),
         host=str(c.get("host", "")),
         tcp_port=int(c.get("tcp_port", 502)),
-        timeout=float(c.get("timeout", 1.0)),
+        timeout=float(c.get("timeout", 2.0)),
     )
     if ctype == "rtu" and not conn.port:
         raise ConfigError("connection.port wajib untuk rtu (mis. COM5 atau /dev/ttyUSB0)")

@@ -77,7 +77,12 @@ def _block(regs: dict, bits: bool) -> list[SimData]:
     return [SimData(address=a, values=list(v), datatype=dt) for a, v in sorted(regs.items())]
 
 
+RESPONSE_DELAY = 0.0  # detik; --delay-ms meniru device lambat (mis. sensor SHT20/MD02 ±600 ms)
+
+
 async def _reject_writes(function_code, start_address, address, count, current_registers, set_values):
+    if RESPONSE_DELAY:
+        await asyncio.sleep(RESPONSE_DELAY)
     # Simulator juga read-only: tolak semua request tulis.
     if set_values is not None:
         return ExcCodes.ILLEGAL_FUNCTION
@@ -111,18 +116,22 @@ async def run_tcp(host: str, port: int, unit_ids: list[int]) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--delay-ms", type=float, default=0, help="Tunda setiap jawaban (meniru device lambat)")
     sub = ap.add_subparsers(dest="mode", required=True)
-    r = sub.add_parser("rtu")
+    r = sub.add_parser("rtu", parents=[common])
     r.add_argument("--port", required=True)
     r.add_argument("--baud", type=int, default=19200)
     r.add_argument("--parity", default="E", choices=["N", "E", "O"])
     r.add_argument("--id", type=int, default=7)
-    t = sub.add_parser("tcp")
+    t = sub.add_parser("tcp", parents=[common])
     t.add_argument("--host", default="127.0.0.1")
     t.add_argument("--port", type=int, default=5020)
     t.add_argument("--unit", type=int, nargs="+", default=[1])
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
+    global RESPONSE_DELAY
+    RESPONSE_DELAY = a.delay_ms / 1000
     logging.basicConfig(level=logging.DEBUG if a.verbose else logging.ERROR)
     logging.getLogger("pymodbus").setLevel(logging.DEBUG if a.verbose else logging.CRITICAL)
     try:

@@ -5,6 +5,8 @@ dari adaptor RS485 yang memantulkan byte yang dikirim.
 """
 from __future__ import annotations
 
+import os
+import subprocess
 import time
 
 import serial
@@ -47,12 +49,36 @@ def open_serial(port: str, baud: int, parity: str, stopbits: float = 1, timeout:
         msg = str(e)
         hint = "Cek nama port dengan `mbprobe ports`."
         low = msg.lower()
-        if "busy" in low or "access is denied" in low or "permission" in low or "in use" in low:
-            hint = (
-                "Port sedang dipakai program lain (tutup Modbus Poll/PuTTY/Arduino IDE), "
-                "atau di Linux tambahkan user ke grup dialout."
-            )
+        if "busy" in low or "access is denied" in low or "in use" in low:
+            owners = port_owners(port)
+            who = f" Dipegang oleh: {', '.join(owners)}." if owners else ""
+            hint = ("Port sedang dipakai program lain (Node-RED, Modbus Poll, PuTTY, Arduino IDE, "
+                    f"atau mbprobe lain) — tutup/stop dulu.{who}")
+        elif "permission" in low:
+            hint = "Tidak ada izin akses port. Di Linux: sudo usermod -aG dialout $USER lalu login ulang."
         raise PortError(f"Tidak bisa membuka {port}: {msg}. {hint}") from e
+
+
+def port_owners(port: str) -> list[str]:
+    """Nama proses yang sedang membuka port (Linux/macOS via lsof). Di macOS cek juga pasangan tty/cu."""
+    if os.name == "nt":
+        return []
+    paths = {port}
+    if port.startswith("/dev/cu."):
+        paths.add(port.replace("/dev/cu.", "/dev/tty.", 1))
+    elif port.startswith("/dev/tty."):
+        paths.add(port.replace("/dev/tty.", "/dev/cu.", 1))
+    try:
+        out = subprocess.run(["lsof", "-Fpc", *sorted(paths)], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    owners, pid = [], ""
+    for line in out.splitlines():
+        if line.startswith("p"):
+            pid = line[1:]
+        elif line.startswith("c"):
+            owners.append(f"{line[1:]} (PID {pid})")
+    return list(dict.fromkeys(owners))
 
 
 class RtuTransport:
@@ -70,6 +96,8 @@ class RtuTransport:
         self._ser = open_serial(port, baud, self.parity, stopbits)
         self._t_char = char_time(baud, self.parity, stopbits)
         self._last_io = 0.0
+        self._prev: tuple[int, int, float] | None = None  # (slave, fc, waktu kirim) request sebelumnya
+        self.late: list[dict] = []  # balasan yang datang setelah timeout
 
     @property
     def link(self) -> str:
@@ -104,9 +132,13 @@ class RtuTransport:
         t0 = time.monotonic()
         try:
             self._silence()
+            self._check_stale()
             self._ser.reset_input_buffer()
+            if self.session:
+                self.session.log_tx(self.link, tx, f"id={slave} fc={fc} addr={addr} count={count}")
             self._ser.write(tx)
             self._ser.flush()
+            t_sent = time.monotonic()
             buf = bytearray()
             # waktu kirim request + estimasi panjang response maksimum + timeout pengguna
             exp_bytes = 5 + (2 * count if fc in (3, 4) else (count + 7) // 8)
@@ -130,11 +162,48 @@ class RtuTransport:
         finally:
             self._last_io = time.monotonic()
         r.elapsed_ms = (time.monotonic() - t0) * 1000
+        self._prev = (slave, fc, t_sent) if r.status in ("timeout", "crc_error") else None
+        if r.status == "late":
+            self._record_late(slave, r.message, None)
         if r.echo:
             self.echo_seen = True
         if self.session:
-            self.session.log_result(self.link, r)
+            self.session.log_rx(self.link, r)
         return r
+
+    def _record_late(self, slave: int, what: str, delay_ms: float | None) -> None:
+        info = {"slave": slave, "baud": self.baud, "parity": self.parity, "detail": what, "delay_ms": delay_ms}
+        self.late.append(info)
+        if self.session:
+            d = f" ±{delay_ms:.0f} ms setelah request" if delay_ms else ""
+            self.session.log(f"RX-LATE {self.link} id={slave}{d}: {what}")
+
+    def drain_late(self, wait: float = 1.0) -> list[dict]:
+        """Setelah timeout: tunggu sebentar, laporkan kalau balasan ternyata datang terlambat."""
+        n = len(self.late)
+        if self._prev:
+            time.sleep(wait)
+            try:
+                self._check_stale()
+            except (serial.SerialException, OSError):
+                pass
+        return self.late[n:]
+
+    def _check_stale(self) -> None:
+        """Byte yang masuk di antara request = balasan telat untuk request sebelumnya."""
+        if not self._ser.in_waiting:
+            return
+        stale = self._ser.read(self._ser.in_waiting)
+        if self.session:
+            self.session.log(f"RX-STALE {self.link} | {stale.hex(' ').upper()}")
+        if self._prev and stale:
+            slave, fc, t_sent = self._prev
+            k = stale.find(bytes([slave]))
+            if k >= 0 and crc_ok(stale[k:]):
+                self._record_late(slave, f"balasan FC{stale[k + 1]:02d} datang setelah timeout "
+                                         f"(raw {stale[k:].hex(' ').upper()})",
+                                  (time.monotonic() - t_sent) * 1000)
+        self._prev = None
 
     @staticmethod
     def _candidates(buf: bytes, slave: int, fc: int):
@@ -161,10 +230,24 @@ class RtuTransport:
             elif k > len(tx):
                 r.message = f"{k - len(tx)} byte sampah setelah echo dibuang"
             return True
+        rest = buf[len(tx):] if buf.startswith(tx) else buf
+        if len(rest) >= 4 and rest[0] == r.slave and crc_ok(rest):
+            rfc = rest[1]
+            r.rx, r.echo = buf, rest is not buf
+            if (rfc & 0x7F) in (1, 2, 3, 4):
+                # FC baca lain dari slave yang sama → jawaban telat untuk request sebelumnya
+                r.status = "late"
+                r.message = (f"balasan FC{rfc & 0x7F:02d} untuk request sebelumnya datang terlambat — "
+                             "device lambat, naikkan --timeout")
+            else:
+                r.status = "nonstandard"
+                r.message = (f"device menjawab dengan frame non-standar FC 0x{rfc:02X} "
+                             f"(data {rest[2:-2].hex(' ').upper() or '-'}) — device hidup, tapi alamat/FC ini "
+                             "kemungkinan tidak didukung")
+            return True
         return False
 
-    @staticmethod
-    def _classify_failure(buf: bytes, tx: bytes, r: Result) -> None:
+    def _classify_failure(self, buf: bytes, tx: bytes, r: Result) -> None:
         r.rx = buf
         if not buf:
             r.status = "timeout"
@@ -177,6 +260,10 @@ class RtuTransport:
         rest = buf[len(tx):] if buf.startswith(tx) else buf
         r.echo = rest is not buf
         if len(rest) >= 4 and crc_ok(rest):
+            if self._prev and rest[0] == self._prev[0]:
+                # jawaban telat dari slave request sebelumnya (mis. scan ID berikutnya)
+                self._record_late(rest[0], f"balasan FC{rest[1]:02d} datang setelah timeout "
+                                           f"(raw {rest.hex(' ').upper()})", None)
             r.status = "invalid"
             r.message = (f"frame Modbus valid dari slave {rest[0]} FC {rest[1]}, bukan jawaban request ini "
                          "(ada master/device lain di bus?)")

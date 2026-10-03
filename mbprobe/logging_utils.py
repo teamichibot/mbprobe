@@ -65,7 +65,11 @@ class Session:
         self.log(f"TX {link} {note} | {hexs(tx)}".replace("  ", " "))
 
     def log_result(self, link: str, r: Result) -> None:
+        """TX + RX sekaligus (untuk transport yang tidak mencatat TX saat kirim)."""
         self.log_tx(link, r.tx, f"id={r.slave} fc={r.fc} addr={r.addr} count={r.count}")
+        self.log_rx(link, r)
+
+    def log_rx(self, link: str, r: Result) -> None:
         extra = ""
         if r.status == "exception":
             extra = f" exc={r.exc_code}"

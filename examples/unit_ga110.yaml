@@ -7,7 +7,7 @@ connection:
   parity: N
   stopbits: 1
   slave_id: 1
-  timeout: 1.0
+  timeout: 2.0
   # untuk tcp:
   # host: 192.168.1.50
   # tcp_port: 502

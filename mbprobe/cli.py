@@ -21,7 +21,7 @@ from .hints import HINT_CRC, HINT_PORT_TCP, HINT_TIMEOUT_RTU, HINT_TIMEOUT_TCP
 from .logging_utils import Session
 from .poll import Poller
 from .protocol import EXCEPTION_NAMES, FC_NAMES, Result, hexs, max_count
-from .scan import (DEFAULT_POLL_INTERVAL, DEFAULT_SCAN_DELAY, MIN_POLL_INTERVAL, MIN_SCAN_DELAY,
+from .scan import (DEFAULT_POLL_INTERVAL, DEFAULT_RTU_SCAN_TIMEOUT, DEFAULT_RTU_TIMEOUT, DEFAULT_SCAN_DELAY, MIN_POLL_INTERVAL, MIN_SCAN_DELAY,
                    DeviceSilent, RegRow, clamp_delay, compress_ranges, estimate_rtu_seconds, expand_hosts,
                    parse_int_list, read_range, scan_rtu, scan_tcp)
 from .sniff import sniff as do_sniff
@@ -101,7 +101,7 @@ def make_transport(rtu: Optional[str], tcp: Optional[str], tcp_port: int, baud: 
     if bool(rtu) == bool(tcp):
         raise typer.BadParameter("Pilih salah satu: --rtu PORT atau --tcp HOST")
     if rtu:
-        return RtuTransport(rtu, baud, parity_list(parity)[0], stopbits, timeout or 1.0, session=s)
+        return RtuTransport(rtu, baud, parity_list(parity)[0], stopbits, timeout or DEFAULT_RTU_TIMEOUT, session=s)
     return TcpTransport(tcp, tcp_port, timeout or 2.0, session=s)
 
 
@@ -115,8 +115,17 @@ def explain_failure(r: Result, t) -> None:
         elif r.exc_code == 1:
             console.print("  → FC tidak didukung. Coba --fc 3 ↔ --fc 4.")
         return
+    if r.status == "nonstandard":
+        console.print(f"[yellow]Device menjawab, tapi dengan frame non-standar.[/] {r.message}")
+        console.print("  → Device hidup. Coba alamat lain (mis. --addr 1) atau FC lain (3 ↔ 4).")
+        return
+    if r.status == "late":
+        warn(f"Device hidup tapi lambat: {r.message}, lebih lama dari --timeout. Ulangi dengan --timeout 2.")
+        return
     if r.status == "timeout":
         err(HINT_TIMEOUT_RTU if t.kind == "rtu" else HINT_TIMEOUT_TCP)
+        if getattr(t, "late", None):
+            warn("Balasan datang setelah timeout — device lambat, ulangi dengan --timeout 2.")
     elif r.status == "crc_error":
         err(HINT_CRC)
         console.print(f"  [dim]raw: {hexs(r.rx)}[/]")
@@ -149,7 +158,8 @@ OPT_BAUD = typer.Option(9600, "--baud", "-b")
 OPT_PARITY = typer.Option("N", "--parity", "-p", help="N / E / O")
 OPT_STOP = typer.Option(1.0, "--stopbits", help="1 atau 2")
 OPT_ID = typer.Option(1, "--id", "--unit", "-u", help="Slave ID (RTU) / unit ID (TCP)")
-OPT_TIMEOUT = typer.Option(None, "--timeout", "-t", help="Timeout response (detik). Default RTU 1.0, TCP 2.0")
+OPT_TIMEOUT = typer.Option(None, "--timeout", "-t",
+                           help="Timeout response (detik). Default RTU 2.0 (sensor murah bisa butuh ±1 s), TCP 2.0")
 OPT_FC = typer.Option(3, "--fc", help="1=coils 2=discrete inputs 3=holding 4=input registers")
 OPT_DELAY = typer.Option(DEFAULT_SCAN_DELAY, "--delay", help=f"Jeda antar request, detik (min {MIN_SCAN_DELAY})")
 
@@ -316,14 +326,17 @@ def scan_rtu_cmd(
     bauds: str = typer.Option("9600,19200,38400", "--bauds"),
     parity: str = typer.Option("N,E", "--parity", "-p", help="Daftar parity, mis. N,E,O"),
     ids: str = typer.Option("1-32", "--ids", help="Rentang slave ID, mis. 1-247 atau 1,2,10"),
-    timeout: float = typer.Option(0.3, "--timeout", "-t"),
+    timeout: float = typer.Option(DEFAULT_RTU_SCAN_TIMEOUT, "--timeout", "-t",
+                                  help="Tunggu jawaban per request (detik). Sensor murah bisa butuh ±0,6 s; "
+                                       "0,3 cukup untuk PLC/power meter yang cepat"),
+    addr: int = typer.Option(0, "--addr", "-a", help="Alamat register yang dipakai untuk probe"),
     delay: float = OPT_DELAY,
     stopbits: float = OPT_STOP,
     stop_on_first: bool = typer.Option(False, "--stop-on-first", help="Berhenti di temuan pertama"),
     label: str = OPT_LABEL,
     out: str = OPT_OUT,
 ):
-    """Cari device RTU: coba baud × parity × slave ID dengan FC03 (lalu FC04) alamat 0 count 1."""
+    """Cari device RTU: coba baud × parity × slave ID dengan FC03 (lalu FC04) di --addr, count 1."""
     delay = clamp_delay(delay, MIN_SCAN_DELAY, "--delay", warn)
     bl = parse_int_list(bauds, 300, 1_000_000)
     pl = parity_list(parity)
@@ -342,27 +355,43 @@ def scan_rtu_cmd(
 
             def on_hit(h):
                 csvf.add([h.baud, h.parity, h.slave, h.fc, h.status, h.exc_code, h.detail])
-                prog.console.print(f"[bold green]DITEMUKAN[/] {h.baud} {h.parity} ID {h.slave} FC{h.fc:02d}: {h.detail}")
+                fc = f" FC{h.fc:02d}" if h.fc else ""
+                prog.console.print(f"[bold green]DITEMUKAN[/] {h.baud} {h.parity} ID {h.slave}{fc}: {h.detail}")
 
-            rep = scan_rtu(port, bl, pl, il, timeout, delay, stopbits, stop_on_first, s, on_hit, on_attempt)
-        _scan_rtu_summary(rep, s, port)
+            rep = scan_rtu(port, bl, pl, il, timeout, delay, stopbits, stop_on_first, s, on_hit, on_attempt,
+                           probe_addr=addr)
+        _scan_rtu_summary(rep, s, port, timeout, addr)
 
 
-def _scan_rtu_summary(rep, s: Session, port: str) -> None:
+def _scan_rtu_summary(rep, s: Session, port: str, timeout: float = 1.0, addr: int = 0) -> None:
     console.print()
     if rep.hits:
         tb = Table(title="Device RTU ditemukan")
         for c in ("Baud", "Parity", "Slave ID", "FC", "Response"):
             tb.add_column(c)
         for h in rep.hits:
-            tb.add_row(str(h.baud), h.parity, str(h.slave), f"{h.fc:02d}", h.detail)
+            tb.add_row(str(h.baud), h.parity, str(h.slave), f"{h.fc:02d}" if h.fc else "-", h.detail)
         console.print(tb)
         h = next((x for x in rep.hits if x.status == "ok"), rep.hits[0])
-        if not INTERACTIVE:
-            console.print(f"Langkah berikut: [bold]mbprobe read --rtu {port} --baud {h.baud} --parity {h.parity} "
-                          f"--id {h.slave} --fc {h.fc} --addr 0 --count 10[/]")
+        conn = f"--rtu {port} --baud {h.baud} --parity {h.parity} --id {h.slave}"
+        if h.status == "ok":
+            nxt = f"read --fc {h.fc} --addr {addr} --count 10"
+        else:
+            nxt = f"dump --fc {h.fc or 3} --from 0 --to 100"
+            console.print(f"[dim]Device hidup tapi alamat {addr} tidak dijawab normal → petakan alamat valid dulu "
+                          "dengan dump (coba FC03 dan FC04).[/]")
+        console.print(f"Langkah berikut: [bold]{'' if INTERACTIVE else 'mbprobe '}{nxt}"
+                      f"{'' if INTERACTIVE else ' ' + conn}[/]")
+    elif rep.extra.get("rx_bytes", 0) == 0:
+        err("Tidak ada SATU byte pun yang diterima di semua kombinasi. Biasanya ini masalah fisik: "
+            "A/B tertukar, device belum dapat daya, kabel/terminal longgar, atau port dipakai program lain.")
+        console.print(f"  Kalau wiring yakin benar: device mungkin lambat (coba [bold]--timeout 2[/], sekarang "
+                      f"{timeout:g}) atau tidak menjawab alamat {addr} (coba [bold]--addr 1[/]).")
     else:
         err("Tidak ada device yang menjawab. " + HINT_TIMEOUT_RTU)
+    if rep.extra.get("late"):
+        warn(f"Ada {len(rep.extra['late'])} balasan yang datang SETELAH timeout {timeout:g} s — device lambat. "
+             f"Ulangi dengan --timeout {max(2.0, timeout * 2):g} supaya pembacaan andal.")
     if rep.crc_hints:
         hint = ", ".join(f"{b} {p}: {n}×" for (b, p), n in rep.crc_hints.items())
         warn(f"Ada byte balasan dengan CRC/format salah di: {hint}. Kemungkinan ada device tapi baud/parity "
@@ -373,6 +402,8 @@ def _scan_rtu_summary(rep, s: Session, port: str) -> None:
         "hits": [h.__dict__ for h in rep.hits],
         "crc_hints": [{"baud": b, "parity": p, "count": n} for (b, p), n in rep.crc_hints.items()],
         "echo": rep.echo, "attempts": rep.attempts, "interrupted": rep.interrupted,
+        "late": rep.extra.get("late", []), "rx_bytes": rep.extra.get("rx_bytes", 0),
+        "timeout": timeout, "probe_addr": addr,
     })
     if rep.interrupted:
         raise KeyboardInterrupt
@@ -464,6 +495,10 @@ def read(
         t = make_transport(rtu, tcp, tcp_port, baud, parity, stopbits, timeout, s)
         with t:
             r = t.request(slave, fc, addr, count)
+            if t.kind == "rtu" and r.status == "timeout":
+                for info in t.drain_late(1.5):
+                    r.status, r.message = "late", f"device menjawab {info['delay_ms']:.0f} ms setelah request" \
+                        if info.get("delay_ms") else info["detail"]
         console.print(f"[dim]{t.link} id={slave} FC{fc:02d} ({FC_NAMES[fc]}) addr={addr} count={count} "
                       f"{r.elapsed_ms:.0f} ms[/]")
         if r.echo:
@@ -618,12 +653,18 @@ def _dump_summary(rows, stats, error, s, t) -> list[dict]:
         _print_ranges(ranges)
     n_ok = sum(1 for r in rows if r.status == "ok")
     n_exc = sum(1 for r in rows if r.status == "exception")
-    console.print(f"{n_ok} alamat valid, {n_exc} exception, {len(rows) - n_ok - n_exc} gagal; "
-                  f"{stats.get('requests', '?')} request.")
+    n_ns = sum(1 for r in rows if r.status == "nonstandard")
+    ns = f", {n_ns} ditolak (non-standar)" if n_ns else ""
+    console.print(f"{n_ok} alamat valid, {n_exc} exception{ns}, {len(rows) - n_ok - n_exc - n_ns} gagal "
+                  f"(timeout/CRC); {stats.get('requests', '?')} request.")
+    if getattr(t, "late", None):
+        warn(f"{len(t.late)} balasan datang setelah timeout — device lambat. Ulangi dengan --timeout "
+             f"{max(3.0, t.timeout * 2):g} supaya peta alamat akurat.")
     if error and getattr(s, "pending_exc", None) is None:
         err(error + " " + (HINT_TIMEOUT_RTU if t.kind == "rtu" else HINT_TIMEOUT_TCP))
     s.json("summary.json", {"ranges": ranges, "stats": stats, "error": error,
-                            "valid": n_ok, "exception": n_exc})
+                            "valid": n_ok, "exception": n_exc, "nonstandard": n_ns,
+                            "late": len(getattr(t, "late", []))})
     return ranges
 
 

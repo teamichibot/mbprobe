@@ -1,0 +1,15 @@
+# Sensor suhu & kelembapan RS485 murah (MD02 / SHT20), dites 2026-10-03:
+#  - 9600 8N1, slave ID 1, FC04 alamat 1 = suhu ×0,01 °C, alamat 2 = kelembapan ×0,01 %RH
+#  - lambat: jawab ±600 ms, bisa ±1,1 s kalau request beruntun → timeout 2 s
+#  - alamat/FC yang tidak didukung dijawab frame non-standar "01 09 02", bukan exception Modbus
+name: Sensor SHT20
+connection:
+  type: rtu
+  port: /dev/cu.usbserial-1140   # Windows: COMx
+  baud: 9600
+  parity: N
+  slave_id: 1
+  timeout: 2.0
+registers:
+  - {name: suhu, fc: 4, addr: 1, type: int16, scale: 0.01, unit: C}
+  - {name: kelembapan, fc: 4, addr: 2, type: uint16, scale: 0.01, unit: "%RH"}

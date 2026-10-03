@@ -348,3 +348,50 @@ def test_tcp_connection_refused(tmp_path):
     cp, d = mbprobe(tmp_path, "read", "--tcp", "127.0.0.1", "--tcp-port", free_port(), check=False)
     assert summary(d)["status"] == "port_error"
     assert "Gagal konek" in cp.stdout
+
+
+# ------------------------------------------------------------------ device lambat (temuan hardware: sensor SHT20 ±600 ms)
+
+@pytest.fixture(scope="module")
+def slow_bus():
+    b = VirtualBus(2).start()
+    sim = start_sim(["rtu", "--port", b.paths[0], "--baud", "9600", "--parity", "N", "--id", "1",
+                     "--delay-ms", "600"])
+    yield b
+    stop(sim)
+    b.stop()
+
+
+def test_scan_finds_slow_device_with_default_timeout(slow_bus, tmp_path):
+    _, d = mbprobe(tmp_path, "scan-rtu", "--port", slow_bus.paths[1], "--bauds", "9600", "--parity", "N",
+                   "--ids", "1-2")
+    hits = summary(d)["hits"]
+    assert [(h["slave"], h["status"]) for h in hits] == [(1, "ok")]
+
+
+def test_scan_short_timeout_reports_late_device(slow_bus, tmp_path):
+    cp, d = mbprobe(tmp_path, "scan-rtu", "--port", slow_bus.paths[1], "--bauds", "9600", "--parity", "N",
+                    "--ids", "1-3", "--timeout", "0.3")
+    s = summary(d)
+    assert any(h["slave"] == 1 for h in s["hits"])  # tetap terdeteksi lewat balasan telat
+    assert s["late"] and "device lambat" in cp.stdout
+
+
+def test_read_slow_device_default_timeout(slow_bus, tmp_path):
+    _, d = mbprobe(tmp_path, "read", "--rtu", slow_bus.paths[1], "--id", 1, "--addr", 120, "--count", 1)
+    assert summary(d)["values"] == [370]
+
+
+def test_read_too_short_timeout_says_slow(slow_bus, tmp_path):
+    cp, d = mbprobe(tmp_path, "read", "--rtu", slow_bus.paths[1], "--id", 1, "--addr", 120, "--count", 1,
+                    "--timeout", 0.3)
+    assert summary(d)["status"] == "late"
+    assert "lambat" in cp.stdout
+
+
+def test_scan_all_silent_says_physical(tmp_path):
+    with VirtualBus(2) as b:  # tidak ada device sama sekali
+        cp, d = mbprobe(tmp_path, "scan-rtu", "--port", b.paths[1], "--bauds", "9600", "--parity", "N",
+                        "--ids", "1-2", "--timeout", 0.1)
+    assert summary(d)["rx_bytes"] == 0
+    assert "SATU byte" in cp.stdout and "A/B" in cp.stdout

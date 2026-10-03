@@ -43,6 +43,7 @@ LOCAL_CMDS = {
     "connect": "Atur koneksi aktif (RTU/TCP) — tanpa argumen: wizard",
     "status": "Tampilkan koneksi & sesi aktif",
     "label": "Set label sesi, mis. `label ZR250`",
+    "timeout": "Set timeout koneksi aktif (detik), mis. `timeout 2` untuk device lambat",
     "open": "Buka folder sesi terakhir",
     "help": "Daftar perintah & contoh",
     "clear": "Bersihkan layar",
@@ -70,6 +71,7 @@ class Ctx:
     parity: str = "N"
     stopbits: float = 1.0
     slave: int = 1
+    timeout: float | None = None  # None = default command
     host: str = ""
     tcp_port: int = 502
     label: str = ""
@@ -79,7 +81,8 @@ class Ctx:
     def describe(self) -> str:
         if self.kind == "rtu":
             sb = int(self.stopbits) if self.stopbits == int(self.stopbits) else self.stopbits
-            return f"RTU {self.port} {self.baud} {self.parity}{sb} · ID {self.slave}"
+            tmo = f" · timeout {self.timeout:g}s" if self.timeout else ""
+            return f"RTU {self.port} {self.baud} {self.parity}{sb} · ID {self.slave}{tmo}"
         if self.kind == "tcp":
             return f"TCP {self.host}:{self.tcp_port} · unit {self.slave}"
         if self.port:
@@ -87,11 +90,12 @@ class Ctx:
         return ""
 
     def conn_args(self) -> list[str]:
+        t = ["--timeout", f"{self.timeout:g}"] if self.timeout else []
         if self.kind == "rtu":
             return ["--rtu", self.port, "--baud", str(self.baud), "--parity", self.parity,
-                    "--stopbits", str(self.stopbits), "--id", str(self.slave)]
+                    "--stopbits", str(self.stopbits), "--id", str(self.slave), *t]
         if self.kind == "tcp":
-            return ["--tcp", self.host, "--tcp-port", str(self.tcp_port), "--unit", str(self.slave)]
+            return ["--tcp", self.host, "--tcp-port", str(self.tcp_port), "--unit", str(self.slave), *t]
         return []
 
 
@@ -338,6 +342,7 @@ class Repl:
             ("dump", "Petakan rentang alamat", "dump --from 0 --to 2000 --fc 3"),
             ("poll", "Log berkala dari config YAML", "poll --config unit.yaml --interval 5"),
             ("label", "Label sesi untuk folder hasil", "label ZR250"),
+            ("timeout", "Timeout koneksi aktif", "timeout 2  (device lambat)"),
             ("status", "Koneksi & sesi aktif", ""),
             ("open", "Buka folder sesi terakhir", ""),
             ("exit", "Keluar", "atau Ctrl+D"),
@@ -519,10 +524,17 @@ class Repl:
                 h = hits[h]
             if len(hits) > 1 or _ask_yes(self.session, f"Pakai {h['baud']} {h['parity']} ID {h['slave']} sebagai koneksi?"):
                 c.kind, c.port, c.baud, c.parity, c.slave = "rtu", port, h["baud"], h["parity"], h["slave"]
+                # device lambat → simpan timeout yang cukup supaya read/find/dump berikutnya andal
+                late_ms = [x.get("delay_ms") or 0 for x in s.get("late", [])]
+                c.timeout = max(3.0, max(late_ms) / 1000 * 2) if late_ms else None  # None = default 2 s
                 console.print(f"[green]✔[/] Koneksi aktif: [bold]{c.describe()}[/]")
-                fc = h.get("fc", 3)
-                console.print(f" [dim]Lanjut:[/] [bold]read --fc {fc} --addr 0 --count 10[/]  [dim]atau[/]  "
-                              f"[bold]find --fc {fc} --value <angka di layar>[/]")
+                fc = h.get("fc") or 3
+                if h.get("status") == "ok":
+                    console.print(f" [dim]Lanjut:[/] [bold]read --fc {fc} --addr {s.get('probe_addr', 0)} --count 10[/]"
+                                  f"  [dim]atau[/]  [bold]find --fc {fc} --value <angka di layar>[/]")
+                else:
+                    console.print(f" [dim]Lanjut: petakan alamat valid →[/] [bold]dump --fc 3 --to 100[/]  [dim]lalu[/]  "
+                                  "[bold]dump --fc 4 --to 100[/]")
         elif cmd == "scan-tcp":
             found = [(h["host"], m) for h in s.get("hosts", []) for m in h.get("modbus", [])
                      if m.get("status") in ("ok", "exception")]
@@ -576,6 +588,12 @@ class Repl:
             self.status()
         elif cmd == "connect":
             self.cmd_connect(rest)
+        elif cmd == "timeout":
+            try:
+                self.ctx.timeout = float(rest[0]) if rest else None
+                console.print(f"[green]✔[/] Timeout: [bold]{self.ctx.timeout or 'default'}[/]")
+            except ValueError:
+                console.print("[red]Format: timeout 2[/]")
         elif cmd == "label":
             self.ctx.label = " ".join(rest)
             console.print(f"[green]✔[/] Label sesi: [bold]{self.ctx.label or '-'}[/]")

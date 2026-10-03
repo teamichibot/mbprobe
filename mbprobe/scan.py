@@ -15,6 +15,10 @@ from .transport_tcp import TcpTransport, port_open
 MIN_POLL_INTERVAL = 0.5
 MIN_SCAN_DELAY = 0.05
 DEFAULT_SCAN_DELAY = 0.1
+# Sebagian device (mis. sensor SHT20/MD02 murah) baru menjawab setelah ±600 ms.
+DEFAULT_RTU_SCAN_TIMEOUT = 1.0
+# read/dump/find/poll: sensor tsb bisa butuh ±1,1 s kalau request datang beruntun.
+DEFAULT_RTU_TIMEOUT = 2.0
 DEFAULT_POLL_INTERVAL = 5.0
 
 
@@ -74,14 +78,36 @@ class ScanReport:
 def _hit_detail(r: Result) -> str:
     if r.status == "ok":
         return f"OK value={r.values}"
-    return f"EXCEPTION {r.exc_code:02d} {EXCEPTION_NAMES.get(r.exc_code, '?')}"
+    if r.status == "exception":
+        return f"EXCEPTION {r.exc_code:02d} {EXCEPTION_NAMES.get(r.exc_code, '?')}"
+    return f"{r.status.upper()}: {r.message}"
 
 
 def scan_rtu(port: str, bauds: list[int], parities: list[str], ids: list[int], timeout: float,
              delay: float, stopbits: float = 1, stop_on_first: bool = False, session=None,
              on_hit: Callable[[RtuHit], None] | None = None,
-             on_attempt: Callable[[int, str], None] | None = None) -> ScanReport:
+             on_attempt: Callable[[int, str], None] | None = None, probe_addr: int = 0) -> ScanReport:
+    """Device dianggap ADA kalau ada frame CRC-valid dari ID tsb: ok, exception, non-standar, atau telat."""
     rep = ScanReport()
+    rep.extra["late"] = []
+    rep.extra["rx_bytes"] = 0
+    seen: set[tuple[int, str, int]] = set()
+
+    def add_hit(h: RtuHit):
+        key = (h.baud, h.parity, h.slave)
+        if key in seen:
+            return
+        seen.add(key)
+        rep.hits.append(h)
+        if on_hit:
+            on_hit(h)
+
+    def collect_late(t, n_before: int):
+        for info in t.late[n_before:]:
+            rep.extra["late"].append(info)
+            add_hit(RtuHit(info["baud"], info["parity"], info["slave"], 0, "late",
+                           f"LAMBAT: {info['detail']} — naikkan --timeout"))
+
     try:
         for baud in bauds:
             for parity in parities:
@@ -91,25 +117,30 @@ def scan_rtu(port: str, bauds: list[int], parities: list[str], ids: list[int], t
                 with RtuTransport(port, baud, parity, stopbits, timeout, session=session) as t:
                     for sid in ids:
                         hit = None
+                        n_late = len(t.late)
                         for fc in (3, 4):
-                            r = t.request(sid, fc, 0, 1)
+                            r = t.request(sid, fc, probe_addr, 1)
                             rep.attempts += 1
+                            rep.extra["rx_bytes"] += len(r.rx)
                             if r.status == "crc_error":
                                 rep.crc_hints[key] = rep.crc_hints.get(key, 0) + 1
-                            if r.responded:
+                            if r.alive and r.status != "late":
                                 hit = RtuHit(baud, parity, sid, fc, r.status, _hit_detail(r), r.values, r.exc_code)
                                 break
                             time.sleep(delay)
+                        collect_late(t, n_late)
                         if on_attempt:
                             on_attempt(sid, f"{baud} {parity}")
                         if hit:
-                            rep.hits.append(hit)
-                            if on_hit:
-                                on_hit(hit)
-                            if stop_on_first:
-                                rep.echo = rep.echo or t.echo_seen
-                                return rep
+                            add_hit(hit)
                             time.sleep(delay)
+                        if stop_on_first and rep.hits:
+                            rep.echo = rep.echo or t.echo_seen
+                            return rep
+                    # balasan telat untuk ID terakhir baru terlihat kalau ditunggu sebentar
+                    n_late = len(t.late)
+                    t.drain_late(min(1.0, timeout + 0.5))
+                    collect_late(t, n_late)
                     rep.echo = rep.echo or t.echo_seen
     except KeyboardInterrupt:
         rep.interrupted = True
@@ -228,14 +259,14 @@ def read_range(t, slave: int, fc: int, start: int, end: int, block: int, delay: 
             if on_progress:
                 on_progress(count)
             return
-        if r.status == "exception":
+        if r.status in ("exception", "nonstandard"):
             silent = 0
             if count > 1:
                 half = count // 2
                 do(addr, half)
                 do(addr + half, count - half)
                 return
-            on_row(RegRow(addr, None, "exception", r.exc_code))
+            on_row(RegRow(addr, None, r.status, r.exc_code))
             stats["exception"] += 1
             if on_progress:
                 on_progress(1)

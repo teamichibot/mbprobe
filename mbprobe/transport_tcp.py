@@ -67,6 +67,8 @@ class TcpTransport:
         rx = bytearray()
         try:
             self.connect()
+            if self.session:
+                self.session.log_tx(self.link, tx, f"id={slave} fc={fc} addr={addr} count={count}")
             self._sock.sendall(tx)
             while True:
                 hdr = self._recv_exact(7, rx)
@@ -96,7 +98,7 @@ class TcpTransport:
         r.rx = bytes(rx)
         r.elapsed_ms = (time.monotonic() - t0) * 1000
         if self.session:
-            self.session.log_result(self.link, r)
+            self.session.log_rx(self.link, r)
         return r
 
 
